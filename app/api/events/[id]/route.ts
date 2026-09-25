@@ -1,5 +1,14 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/db/client";
+import { HttpError } from "@/lib/http-error";
+import { parseEventInput, type EventInputBody } from "@/lib/events/eventInput";
+import {
+  assertTitleAvailable,
+  generateAllRounds,
+  resolvePersonIds,
+  writeExclusions,
+  writeRoster,
+} from "@/lib/events/persist";
 
 type Gender = "Male" | "Female" | "Non-Binary";
 
@@ -33,6 +42,19 @@ export interface EventDetailRound {
   byes: EventDetailPerson[];
 }
 
+/** One roster entry as needed to prefill the Edit Page's participant rows. */
+export interface EventDetailRosterEntry {
+  personId: number;
+  name: string;
+  gender: Gender;
+}
+
+/** One exclusion pair as needed to prefill the Edit Page's exclusion list. */
+export interface EventDetailExclusionPair {
+  personAId: number;
+  personBId: number;
+}
+
 export interface EventDetail {
   id: number;
   title: string;
@@ -45,6 +67,12 @@ export interface EventDetail {
   /** roundNumber of the first round that isn't fully complete, or null if
    * every round (that exists so far) is complete. */
   currentRoundNumber: number | null;
+  /** Full roster (independent of any one round's byes) — used to prefill
+   * the Edit Page's participant rows. */
+  roster: EventDetailRosterEntry[];
+  /** Full exclusion-pair list by Person id — used to prefill the Edit
+   * Page's exclusion list. */
+  exclusionPairs: EventDetailExclusionPair[];
 }
 
 /**
@@ -56,7 +84,9 @@ export interface EventDetail {
  * members with no TeamMember row for the round). Also computes
  * `currentRoundNumber` — the first round that isn't fully complete (a round
  * is complete once every one of its matchups has a recorded winner) — so the
- * client doesn't need to reimplement that logic.
+ * client doesn't need to reimplement that logic. Additionally includes the
+ * full `roster` and `exclusionPairs` (independent of any single round), used
+ * by the Edit Page to prefill its form.
  */
 export async function GET(
   _request: Request,
@@ -98,6 +128,12 @@ export async function GET(
        JOIN Person p ON p.id = ep.personId
        WHERE ep.eventId = ?
        ORDER BY p.name ASC`,
+    )
+    .all(eventId);
+
+  const exclusionPairs = db
+    .prepare<[number], EventDetailExclusionPair>(
+      "SELECT personAId as personAId, personBId as personBId FROM ExclusionPair WHERE eventId = ?",
     )
     .all(eventId);
 
@@ -167,9 +203,98 @@ export async function GET(
     createdAt: event.createdAt,
     rounds,
     currentRoundNumber,
+    roster: roster.map((p) => ({ personId: p.id, name: p.name, gender: p.gender })),
+    exclusionPairs,
   };
 
   return NextResponse.json(detail);
+}
+
+/**
+ * PUT /api/events/:id
+ *
+ * Edits an event's configuration from the Edit Page (title, description,
+ * # of rounds, team size, roster, exclusions) and regenerates its entire
+ * round-robin schedule from scratch:
+ * - Refuses to edit a `status = 'complete'` event (CLAUDE.md: complete
+ *   events are fully read-only).
+ * - Re-validates the same shape as `POST /api/events` (shared
+ *   `parseEventInput`), rejects a title collision against any *other*
+ *   event, and re-resolves participants to Person ids the same way.
+ * - Replaces the event's EventParticipant and ExclusionPair rows outright
+ *   with the newly-submitted roster/exclusions.
+ * - Deletes every existing Round for the event (cascades to its Teams,
+ *   TeamMembers, and Matchups per the schema's ON DELETE CASCADE — so any
+ *   previously-entered scores are discarded, which is unavoidable since the
+ *   roster/team-size change invalidates the old matchups anyway) and
+ *   regenerates rounds 1..numRounds fresh via `generateAllRounds`.
+ * - All of the above runs in one transaction: if anything throws (invalid
+ *   input, title collision, infeasible exclusions), the whole edit rolls
+ *   back and the event is left exactly as it was before the request.
+ */
+export async function PUT(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const { id } = await params;
+  const eventId = Number(id);
+  if (!Number.isInteger(eventId)) {
+    return NextResponse.json({ error: "Invalid event id" }, { status: 400 });
+  }
+
+  const db = getDb();
+
+  try {
+    let body: EventInputBody;
+    try {
+      body = (await request.json()) as EventInputBody;
+    } catch {
+      throw new HttpError(400, "Invalid JSON body");
+    }
+
+    const { title, description, numRounds, teamSize, participants, exclusions } =
+      parseEventInput(body);
+
+    db.transaction(() => {
+      const existing = db
+        .prepare<[number], { status: "open" | "complete" }>(
+          "SELECT status FROM Event WHERE id = ?",
+        )
+        .get(eventId);
+      if (!existing) {
+        throw new HttpError(404, "Event not found");
+      }
+      if (existing.status === "complete") {
+        throw new HttpError(400, "Cannot edit a completed event");
+      }
+
+      assertTitleAvailable(db, title, eventId);
+
+      const personIds = resolvePersonIds(db, participants);
+
+      db.prepare(
+        "UPDATE Event SET title = ?, description = ?, numRounds = ?, teamSize = ? WHERE id = ?",
+      ).run(title, description, numRounds, teamSize, eventId);
+
+      db.prepare("DELETE FROM EventParticipant WHERE eventId = ?").run(eventId);
+      writeRoster(db, eventId, personIds);
+
+      db.prepare("DELETE FROM ExclusionPair WHERE eventId = ?").run(eventId);
+      writeExclusions(db, eventId, exclusions, personIds);
+
+      // Cascades to Team/TeamMember/Matchup for every existing round.
+      db.prepare("DELETE FROM Round WHERE eventId = ?").run(eventId);
+      generateAllRounds(db, eventId, numRounds);
+    })();
+
+    return NextResponse.json({ id: eventId });
+  } catch (err) {
+    if (err instanceof HttpError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
+    console.error("Failed to update event", err);
+    return NextResponse.json({ error: "Failed to update event" }, { status: 500 });
+  }
 }
 
 /**

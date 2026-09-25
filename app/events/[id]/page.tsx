@@ -186,15 +186,25 @@ export default function EventPage() {
                 {event.teamSize}
               </p>
             </div>
-            <span
-              className={`inline-flex shrink-0 items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                event.status === "complete"
-                  ? "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
-                  : "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300"
-              }`}
-            >
-              {event.status === "complete" ? "Complete" : "Open"}
-            </span>
+            <div className="flex shrink-0 items-center gap-2">
+              <span
+                className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
+                  event.status === "complete"
+                    ? "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                    : "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300"
+                }`}
+              >
+                {event.status === "complete" ? "Complete" : "Open"}
+              </span>
+              {event.status !== "complete" && (
+                <Link
+                  href={`/events/${event.id}/edit`}
+                  className="rounded-md border border-black/[.15] px-3 py-1.5 text-sm font-medium hover:bg-black/[.05] dark:border-white/[.2] dark:hover:bg-white/[.08]"
+                >
+                  Edit
+                </Link>
+              )}
+            </div>
           </div>
 
           <div className="mt-6 flex gap-1 border-b border-black/[.08] dark:border-white/[.1]">
