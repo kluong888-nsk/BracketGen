@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS Event (
   createdAt   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Event titles are unique (case-insensitive) so two events can't share a
+-- name. A separate index (not an inline UNIQUE column constraint) so it
+-- applies retroactively via CREATE ... IF NOT EXISTS even on a database
+-- whose Event table was created before this constraint existed.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_event_title_unique ON Event(title COLLATE NOCASE);
+
 -- EventParticipant: join of Event <-> Person for that event's roster.
 CREATE TABLE IF NOT EXISTS EventParticipant (
   id       INTEGER PRIMARY KEY AUTOINCREMENT,

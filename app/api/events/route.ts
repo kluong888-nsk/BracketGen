@@ -62,6 +62,7 @@ interface CreateEventBody {
  * POST /api/events
  *
  * Creates a new Event from the Creation Page (CLAUDE.md "Creation Page"):
+ * - Rejects a title that matches (case-insensitively) an existing event's.
  * - Reuses an existing Person id for any participant row matched via
  *   type-ahead; creates a new Person (name + gender) for any row that
  *   wasn't matched.
@@ -186,6 +187,16 @@ export async function POST(request: Request) {
 
   try {
     const eventId = db.transaction(() => {
+      // Event titles are unique (case-insensitive) — checked explicitly
+      // for a clear error message, backed by the DB's own unique index
+      // (idx_event_title_unique) as the hard guarantee.
+      const existingTitle = db
+        .prepare<[string], { id: number }>("SELECT id FROM Event WHERE title = ? COLLATE NOCASE")
+        .get(title);
+      if (existingTitle) {
+        throw new HttpError(400, `An event titled "${title}" already exists`);
+      }
+
       // Resolve each participant to a Person id: reuse if a personId was
       // matched via type-ahead, otherwise create a new Person.
       const findPerson = db.prepare<[number], { id: number }>(
