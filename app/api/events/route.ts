@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/db/client";
+import { generateRoundForEvent } from "@/lib/roundrobin/db";
 
 export interface EventListItem {
   id: number;
@@ -68,8 +69,14 @@ interface CreateEventBody {
  *   wasn't matched.
  * - Creates the Event row (status "open"), one EventParticipant row per
  *   roster entry, and one ExclusionPair row per exclusion pair.
- * - Does NOT generate Round 1's teams/matchups (milestone 4/5) — this only
- *   persists the event + roster + exclusions.
+ * - Generates every round up front (rounds 1..numRounds, teams + matchups)
+ *   via `generateRoundForEvent` in a loop within the same transaction, so
+ *   the client's redirect to `/events/[id]` always lands on an event whose
+ *   full schedule already exists. If any round's generation throws (e.g.
+ *   infeasible exclusion constraints per milestone 4), the whole
+ *   transaction — event, roster, exclusions, every round generated so
+ *   far — rolls back and a 400 is returned instead of leaving a
+ *   half-created event.
  *
  * All validation happens server-side too (not just client-side) since this
  * is a plain fetch-able API route.
@@ -258,6 +265,28 @@ export async function POST(request: Request) {
         if (seenPairs.has(key)) continue;
         seenPairs.add(key);
         insertExclusion.run(event.id, personA, personB);
+      }
+
+      // Generate every configured round up front, in the same transaction.
+      // The generator's variety optimization is driven by prior rounds'
+      // *team compositions* (teammate/opponent pairing history), not by
+      // match results, so nothing requires waiting for scores between
+      // rounds — each call's history is derived from the Rounds/Teams
+      // already persisted earlier in this same loop. If any round's
+      // generation throws (e.g. infeasible exclusions), the whole
+      // transaction rolls back via better-sqlite3's nested-transaction
+      // (SAVEPOINT) support and no half-created event is left behind.
+      for (let roundNumber = 1; roundNumber <= numRounds; roundNumber++) {
+        try {
+          generateRoundForEvent(db, event.id, roundNumber);
+        } catch (genErr) {
+          const message =
+            genErr instanceof Error ? genErr.message : `Failed to generate round ${roundNumber}`;
+          throw new HttpError(
+            400,
+            `Event roster is invalid for round generation (round ${roundNumber}): ${message}`,
+          );
+        }
       }
 
       return event.id;
