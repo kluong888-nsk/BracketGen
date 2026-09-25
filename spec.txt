@@ -1,0 +1,36 @@
+Description:
+A web app that can track and drive a tournament. Given a list of users, size of teams, and number of games, it should be able to generate a round robin bracket. Given the outcome of a game, it should also save every individual persons W-L history, record and +/-. This will eventually be used to pick the top X people to participate in a playoff bracket.
+
+Technical Requirements:
+A web app but can be tunneled through localhost, it doesn't have to be a live app. 
+
+Home Page:
+- Shows history of events, can be opened, read and deleted. However no editing once an event is marked as complete
+- Button that allows creation of new event
+
+Creation Page:
+- Title of event (Required)
+- Description of event (optional)
+- Dropdown that allows selection of # of rounds (1-20)
+- Dropdown that allows team size (1-6)
+- Input box that takes # of participants (input boxes then dynamically pop up to match the #)
+	- Dynamic input boxes that allow users to input a name
+	- Names should be saved and be allowed to be reused between events (type ahead functionality)
+	- Next to the name should be a gender dropdown of (Male, Female, Non-Binary)
+- It should also allow an exclusion list (i.e. people who are not allowed to be on the same team)
+
+Events Page:
+- Round Robin matchups for each round
+- Users should be able to click on a matchup and report a result, should require Winner and score
+- Current round should be highlighted and once all matches are complete, can be greyed out, highlighting the next round
+- A tab that allows users to check a leaderboard of all user stats (W-L, scores, +/-)
+
+Round Robin Algorithm:
+- Should maximize variety in both teammates and opponents
+- Should also try to even out gender
+- Should listen to exclusions list and not match up people on that list
+
+
+Extras:
+- A tab that has all users that have participated (sorted alphabetically), choosing a user can show all events a user has participated in.
+- Storage can be csv, json or whatever is easiest
