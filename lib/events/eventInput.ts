@@ -74,6 +74,22 @@ export function parseEventInput(body: EventInputBody): ParsedEventInput {
     throw new HttpError(400, "At least one participant is required");
   }
 
+  // A round needs at least two full teams to produce a single matchup — a
+  // roster smaller than 2*teamSize can, after byes, only ever form at most
+  // one team, which has no opponent to play. Left unvalidated, this used to
+  // silently create an event whose every round showed a formed "team" with
+  // no matchup card (their members appearing to just vanish, not even
+  // counted as a bye) and could never be marked complete, since a
+  // zero-matchup round is never considered scored. Rejecting it here at
+  // creation/edit time — before any rounds are generated — gives the
+  // organizer an actionable error instead of a permanently-stuck event.
+  if (body.participants.length < 2 * teamSize) {
+    throw new HttpError(
+      400,
+      `At least ${2 * teamSize} participants are required for team size ${teamSize} (need at least two full teams to form a matchup)`,
+    );
+  }
+
   const rawParticipants = body.participants as unknown[];
   const participants: ParticipantInput[] = [];
   for (let i = 0; i < rawParticipants.length; i++) {

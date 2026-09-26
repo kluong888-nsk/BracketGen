@@ -390,6 +390,10 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
       if (title.trim().length === 0) errors.push("Title is required.");
       if (visibleParticipants.length === 0) {
         errors.push("At least one participant is required.");
+      } else if (visibleParticipants.length < 2 * teamSize) {
+        errors.push(
+          `Team size ${teamSize} needs at least ${2 * teamSize} participants to form two full teams (currently ${visibleParticipants.length}). Add more participants or lower the team size.`,
+        );
       }
       visibleParticipants.forEach((row, i) => {
         if (row.name.trim().length === 0) {
