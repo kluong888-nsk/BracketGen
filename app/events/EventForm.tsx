@@ -89,6 +89,7 @@ function Select({
  */
 function NameTypeahead({
   value,
+  gender,
   personId,
   excludeIds,
   onChangeName,
@@ -96,6 +97,12 @@ function NameTypeahead({
   onClearMatch,
 }: {
   value: string;
+  /** Identity is (name, gender), not name alone — two people can share a
+   * name as long as their gender differs. Used to gate auto-matching: we
+   * only ever auto-lock onto an existing Person when their gender agrees
+   * with the one already chosen for this row (see the blur handler and the
+   * gender-change effect below). */
+  gender: Gender | "";
   personId: number | null;
   /** Person ids already used by *other* rows on this roster — filtered out
    * of suggestions so the same person can't be selected twice, and flagged
@@ -114,6 +121,10 @@ function NameTypeahead({
   useEffect(() => {
     excludeIdsRef.current = excludeIds;
   }, [excludeIds]);
+  const valueRef = useRef(value);
+  useEffect(() => {
+    valueRef.current = value;
+  }, [value]);
 
   const runSearch = useCallback(async (query: string): Promise<PersonSearchResult[]> => {
     try {
@@ -142,15 +153,52 @@ function NameTypeahead({
     };
   }, [value, personId, runSearch]);
 
+  // If a gender is already chosen for this row, an existing Person only
+  // counts as "the same person" when their gender agrees too — same name,
+  // different gender is a different (allowed) person, not a match.
+  useEffect(() => {
+    if (personId !== null || gender === "") return;
+    const trimmed = valueRef.current.trim();
+    if (trimmed.length === 0) return;
+    let cancelled = false;
+    void runSearch(trimmed).then((results) => {
+      if (cancelled) return;
+      setAllResults(results);
+      const exact = results.filter(
+        (s) =>
+          s.name.trim().toLowerCase() === trimmed.toLowerCase() &&
+          s.gender === gender &&
+          !excludeIdsRef.current.includes(s.id),
+      );
+      if (exact.length === 1) {
+        onSelectPerson(exact[0]);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [gender, personId, runSearch, onSelectPerson]);
+
   const suggestions = allResults.filter((s) => !excludeIds.includes(s.id));
   // Only surface the "already on roster" warning once the field has lost
   // focus, so it doesn't fire mid-keystroke while the user is still typing.
+  // Gated on a gender being chosen (same as auto-match) and compared at
+  // that same gender, since same name + different gender is a different,
+  // allowed person, not a duplicate.
+  const trimmedValue = value.trim();
+  const sameGenderMatches =
+    gender === ""
+      ? []
+      : allResults.filter(
+          (s) => s.name.trim().toLowerCase() === trimmedValue.toLowerCase() && s.gender === gender,
+        );
   const showAlreadyOnRosterWarning =
     !focused &&
     personId === null &&
-    value.trim().length > 0 &&
-    allResults.length > 0 &&
-    suggestions.length === 0;
+    trimmedValue.length > 0 &&
+    gender !== "" &&
+    sameGenderMatches.length > 0 &&
+    sameGenderMatches.every((s) => excludeIds.includes(s.id));
 
   useEffect(() => {
     return () => {
@@ -175,12 +223,15 @@ function NameTypeahead({
           setFocused(false);
           blurTimeoutRef.current = setTimeout(() => setOpen(false), 150);
 
-          // If nothing's matched yet, check whether the typed name is an
-          // exact (case-insensitive) match for exactly one existing,
-          // not-already-used Person, and auto-match it — so typing a full
-          // name and tabbing/clicking away works the same as picking it
-          // from the dropdown.
-          if (personId === null) {
+          // If nothing's matched yet and a gender has already been chosen
+          // for this row, check whether the typed name is an exact
+          // (case-insensitive) match — for that SAME gender — against
+          // exactly one existing, not-already-used Person, and auto-match
+          // it. Without a gender chosen yet we can't tell "this is the same
+          // person" from "this coincidentally shares a name with someone of
+          // a different gender", so we don't guess — see the gender-change
+          // effect above, which re-attempts this once gender is picked.
+          if (personId === null && gender !== "") {
             const trimmed = value.trim();
             if (trimmed.length > 0) {
               if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -189,6 +240,7 @@ function NameTypeahead({
                 const exact = results.filter(
                   (s) =>
                     s.name.trim().toLowerCase() === trimmed.toLowerCase() &&
+                    s.gender === gender &&
                     !excludeIdsRef.current.includes(s.id),
                 );
                 if (exact.length === 1) {
@@ -276,12 +328,16 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
     const parsed = digitsOnly === "" ? 0 : Number(digitsOnly);
     const clamped = Number.isFinite(parsed) ? Math.max(0, Math.min(200, Math.trunc(parsed))) : 0;
     setParticipantCount(clamped);
+    // Lowering the count never discards already-entered rows — it only
+    // hides them (see `visibleParticipants` below). That way typing "4",
+    // backspacing, then typing "6" restores what was already filled in for
+    // the first 4, instead of wiping them out mid-edit. Rows/exclusions
+    // beyond the current count are excluded at render and submit time, not
+    // deleted from state.
     setParticipants((prev) => {
-      if (clamped === prev.length) return prev;
-      if (clamped < prev.length) return prev.slice(0, clamped);
+      if (clamped <= prev.length) return prev;
       return [...prev, ...Array.from({ length: clamped - prev.length }, emptyRow)];
     });
-    setExclusions((prev) => prev.filter((pair) => pair.a < clamped && pair.b < clamped));
   }, []);
 
   const handleAddParticipant = useCallback(() => {
@@ -322,12 +378,20 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
       e.preventDefault();
       setSubmitError(null);
 
+      // Rows/exclusions beyond the current count are kept in state (so
+      // lowering then raising the count restores them) but must never be
+      // validated or submitted — only what's currently visible counts.
+      const visibleParticipants = participants.slice(0, participantCount);
+      const visibleExclusions = exclusions.filter(
+        (pair) => pair.a < participantCount && pair.b < participantCount,
+      );
+
       const errors: string[] = [];
       if (title.trim().length === 0) errors.push("Title is required.");
-      if (participants.length === 0) {
+      if (visibleParticipants.length === 0) {
         errors.push("At least one participant is required.");
       }
-      participants.forEach((row, i) => {
+      visibleParticipants.forEach((row, i) => {
         if (row.name.trim().length === 0) {
           errors.push(`Participant ${i + 1} is missing a name.`);
         }
@@ -336,16 +400,22 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
         }
       });
 
-      const seenPersonRows = new Map<number, number>();
-      participants.forEach((row, i) => {
-        if (row.personId === null) return;
-        const firstIndex = seenPersonRows.get(row.personId);
+      // Identity is (name, gender) — two rows conflict only if BOTH match
+      // (whether they were matched to the same existing Person, or are two
+      // freshly-typed rows that happen to share a name and gender). Same
+      // name with a *different* gender is a different, allowed person.
+      const seenIdentities = new Map<string, number>();
+      visibleParticipants.forEach((row, i) => {
+        const trimmedName = row.name.trim().toLowerCase();
+        if (trimmedName.length === 0 || row.gender === "") return;
+        const key = `${trimmedName}|${row.gender}`;
+        const firstIndex = seenIdentities.get(key);
         if (firstIndex === undefined) {
-          seenPersonRows.set(row.personId, i);
+          seenIdentities.set(key, i);
           return;
         }
         errors.push(
-          `${participantLabel(participants[firstIndex], firstIndex)} and ${participantLabel(row, i)} are the same person and can't both be on the roster.`,
+          `${participantLabel(visibleParticipants[firstIndex], firstIndex)} and ${participantLabel(row, i)} are the same person (same name and gender) and can't both be on the roster.`,
         );
       });
 
@@ -376,12 +446,12 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
             description: description.trim() || undefined,
             numRounds,
             teamSize,
-            participants: participants.map((row) => ({
+            participants: visibleParticipants.map((row) => ({
               personId: row.personId ?? undefined,
               name: row.name.trim(),
               gender: row.gender,
             })),
-            exclusions,
+            exclusions: visibleExclusions,
           }),
         });
 
@@ -404,10 +474,30 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
         window.scrollTo({ top: 0, behavior: "smooth" });
       }
     },
-    [title, description, numRounds, teamSize, participants, exclusions, router, mode, eventId],
+    [
+      title,
+      description,
+      numRounds,
+      teamSize,
+      participants,
+      participantCount,
+      exclusions,
+      router,
+      mode,
+      eventId,
+    ],
   );
 
-  const selectableRows = participants
+  // Rows/exclusions beyond `participantCount` are kept in `participants`/
+  // `exclusions` state (not deleted) so that lowering then raising the
+  // count restores what was already entered — but only the visible slice
+  // should ever be rendered or submitted.
+  const visibleParticipants = participants.slice(0, participantCount);
+  const visibleExclusions = exclusions.filter(
+    (pair) => pair.a < participantCount && pair.b < participantCount,
+  );
+
+  const selectableRows = visibleParticipants
     .map((row, index) => ({ row, index }))
     .filter(({ row }) => row.name.trim().length > 0);
 
@@ -531,9 +621,9 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
             />
           </div>
 
-          {participants.length > 0 && (
+          {visibleParticipants.length > 0 && (
             <ul className="space-y-3">
-              {participants.map((row, index) => (
+              {visibleParticipants.map((row, index) => (
                 <li
                   key={index}
                   className="flex items-start gap-3 rounded-md border border-black/[.08] p-3 dark:border-white/[.1]"
@@ -544,8 +634,9 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
                   <div className="min-w-0 flex-1">
                     <NameTypeahead
                       value={row.name}
+                      gender={row.gender}
                       personId={row.personId}
-                      excludeIds={participants
+                      excludeIds={visibleParticipants
                         .filter((_, i) => i !== index)
                         .map((r) => r.personId)
                         .filter((id): id is number => id !== null)}
@@ -596,7 +687,7 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
             <button
               type="button"
               onClick={handleRemoveLastParticipant}
-              disabled={participants.length === 0}
+              disabled={participantCount === 0}
               className="flex h-9 w-9 items-center justify-center rounded-md border border-black/[.15] text-lg font-medium hover:bg-black/[.05] disabled:opacity-40 disabled:hover:bg-transparent dark:border-white/[.2] dark:hover:bg-white/[.08]"
               aria-label="Remove last participant"
               title="Remove last participant"
@@ -659,23 +750,29 @@ export default function EventForm({ mode, eventId, initial }: EventFormProps) {
               </button>
             </div>
 
-            {exclusions.length > 0 && (
+            {visibleExclusions.length > 0 && (
               <ul className="divide-y divide-black/[.08] border-y border-black/[.08] text-sm dark:divide-white/[.1] dark:border-white/[.1]">
-                {exclusions.map((pair, i) => (
-                  <li key={i} className="flex items-center justify-between gap-4 px-2 py-2">
-                    <span>
-                      {participantLabel(participants[pair.a], pair.a)} &harr;{" "}
-                      {participantLabel(participants[pair.b], pair.b)}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveExclusion(i)}
-                      className="text-red-700 hover:underline dark:text-red-400"
-                    >
-                      Remove
-                    </button>
-                  </li>
-                ))}
+                {exclusions.map((pair, i) => {
+                  // Hide (don't delete) an exclusion whose participant was
+                  // hidden by lowering the count — it reappears if the
+                  // count goes back up, same as the participant rows.
+                  if (pair.a >= participantCount || pair.b >= participantCount) return null;
+                  return (
+                    <li key={i} className="flex items-center justify-between gap-4 px-2 py-2">
+                      <span>
+                        {participantLabel(participants[pair.a], pair.a)} &harr;{" "}
+                        {participantLabel(participants[pair.b], pair.b)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveExclusion(i)}
+                        className="text-red-700 hover:underline dark:text-red-400"
+                      >
+                        Remove
+                      </button>
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </section>

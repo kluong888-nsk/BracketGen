@@ -39,16 +39,24 @@ export function assertTitleAvailable(
 /**
  * Resolves each participant row to a Person id — reusing an existing Person
  * if `personId` was matched via type-ahead, creating a new Person (name +
- * gender) otherwise — and rejects a roster that lists the same person twice.
+ * gender) otherwise — and rejects a roster that lists the same identity
+ * twice. Identity is (name, gender), not name alone: two participants can
+ * share a name as long as their gender differs; two rows only conflict when
+ * both match (whether via the same existing Person id, or two freshly-typed
+ * rows with an identical name + gender).
  */
 export function resolvePersonIds(
   db: Database.Database,
   participants: ParticipantInput[],
 ): number[] {
-  const findPerson = db.prepare<[number], { id: number }>("SELECT id FROM Person WHERE id = ?");
+  const findPerson = db.prepare<[number], { id: number; name: string; gender: Gender }>(
+    "SELECT id, name, gender FROM Person WHERE id = ?",
+  );
   const insertPerson = db.prepare<[string, Gender], { id: number }>(
     "INSERT INTO Person (name, gender) VALUES (?, ?) RETURNING id",
   );
+
+  const seenIdentities = new Set<string>();
 
   const resolvedPersonIds: number[] = participants.map((p) => {
     if (p.personId !== undefined) {
@@ -56,19 +64,29 @@ export function resolvePersonIds(
       if (!existing) {
         throw new HttpError(400, `Participant "${p.name}" has an unknown personId`);
       }
+      const key = `${existing.name.trim().toLowerCase()}|${existing.gender}`;
+      if (seenIdentities.has(key)) {
+        throw new HttpError(
+          400,
+          `"${existing.name}" (${existing.gender}) was added to the roster more than once`,
+        );
+      }
+      seenIdentities.add(key);
       return existing.id;
     }
+
+    const key = `${p.name.trim().toLowerCase()}|${p.gender}`;
+    if (seenIdentities.has(key)) {
+      throw new HttpError(400, `"${p.name}" (${p.gender}) was added to the roster more than once`);
+    }
+    seenIdentities.add(key);
+
     const created = insertPerson.get(p.name, p.gender);
     if (!created) {
       throw new HttpError(500, `Failed to create person "${p.name}"`);
     }
     return created.id;
   });
-
-  const uniquePersonIds = new Set(resolvedPersonIds);
-  if (uniquePersonIds.size !== resolvedPersonIds.length) {
-    throw new HttpError(400, "The same person was added to the roster more than once");
-  }
 
   return resolvedPersonIds;
 }
