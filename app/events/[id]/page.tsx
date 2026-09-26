@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import type { EventDetail, EventDetailMatchup, EventDetailPerson, EventDetailRound } from "@/app/api/events/[id]/route";
@@ -271,15 +271,20 @@ function RoundSection({
   eventId,
   onScored,
   readOnly,
+  sectionRef,
 }: {
   round: EventDetailRound;
   isCurrent: boolean;
   eventId: string;
   onScored: () => Promise<void>;
   readOnly: boolean;
+  /** Registers/unregisters this round's DOM node for the current-round
+   * scroll-preservation logic in the parent (see `roundElementsRef`). */
+  sectionRef: (el: HTMLElement | null) => void;
 }) {
   return (
     <section
+      ref={sectionRef}
       className={`rounded-lg border p-4 ${
         isCurrent
           ? "border-foreground/40 bg-black/[.02] shadow-sm dark:bg-white/[.04]"
@@ -578,6 +583,14 @@ export default function EventPage() {
   const [markingComplete, setMarkingComplete] = useState(false);
   const [markCompleteError, setMarkCompleteError] = useState<string | null>(null);
 
+  // Round-card DOM nodes, keyed by roundNumber, so that when scoring a
+  // round's last matchup advances `currentRoundNumber`, we can scroll the
+  // new current round into the screen position the old one just vacated
+  // (see `refreshEvent` and the effect below) instead of leaving the user
+  // to scroll down and find it themselves.
+  const roundElementsRef = useRef<Map<number, HTMLElement>>(new Map());
+  const pendingScrollAnchorRef = useRef<number | null>(null);
+
   useEffect(() => {
     let ignore = false;
 
@@ -600,13 +613,43 @@ export default function EventPage() {
   /** Passed down to matchup cards; re-fetches the event after a score is
    * saved so completion/current-round state reflects the persisted result. */
   async function refreshEvent() {
+    // Capture where the (about-to-be-former) current round's card sits on
+    // screen right now, before the fetch/re-render — if this save advances
+    // `currentRoundNumber`, the effect below scrolls so the new current
+    // round ends up at this same spot instead of wherever it naturally
+    // falls in the page flow.
+    const oldCurrentRoundNumber = event?.currentRoundNumber ?? null;
+    const oldEl =
+      oldCurrentRoundNumber !== null ? roundElementsRef.current.get(oldCurrentRoundNumber) : null;
+    if (oldEl) {
+      pendingScrollAnchorRef.current = oldEl.getBoundingClientRect().top;
+    }
+
     try {
       const data = await fetchEventDetail(eventId);
       setEvent(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load event");
+      pendingScrollAnchorRef.current = null;
     }
   }
+
+  // Runs after `refreshEvent` swaps in new event data. If that save
+  // advanced `currentRoundNumber` (a round just got fully scored), scroll
+  // so the new current round's card lands where the old one's top was —
+  // consuming the anchor `refreshEvent` stashed right before the re-fetch.
+  useEffect(() => {
+    const anchorTop = pendingScrollAnchorRef.current;
+    if (anchorTop === null || !event || event.currentRoundNumber === null) return;
+    const newEl = roundElementsRef.current.get(event.currentRoundNumber);
+    pendingScrollAnchorRef.current = null;
+    if (!newEl) return;
+    const newTop = newEl.getBoundingClientRect().top;
+    const delta = newTop - anchorTop;
+    if (Math.abs(delta) > 1) {
+      window.scrollBy({ top: delta, behavior: "smooth" });
+    }
+  }, [event]);
 
   /**
    * Handles the "Mark Event Complete" button (milestone 8). Confirms first
@@ -758,6 +801,10 @@ export default function EventPage() {
                     eventId={eventId}
                     onScored={refreshEvent}
                     readOnly={event.status === "complete"}
+                    sectionRef={(el) => {
+                      if (el) roundElementsRef.current.set(round.roundNumber, el);
+                      else roundElementsRef.current.delete(round.roundNumber);
+                    }}
                   />
                 ))}
               </div>
