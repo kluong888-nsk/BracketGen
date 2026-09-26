@@ -9,7 +9,8 @@ import {
   writeExclusions,
   writeRoster,
 } from "@/lib/events/persist";
-import { computeLeaderboard, type LeaderboardRow } from "@/lib/events/leaderboard";
+import { fetchEventDetail } from "@/lib/events/detail";
+import type { LeaderboardRow } from "@/lib/events/leaderboard";
 
 type Gender = "Male" | "Female" | "Non-Binary";
 
@@ -105,117 +106,11 @@ export async function GET(
   }
 
   const db = getDb();
+  const detail = fetchEventDetail(db, eventId);
 
-  const event = db
-    .prepare<
-      [number],
-      {
-        id: number;
-        title: string;
-        description: string | null;
-        numRounds: number;
-        teamSize: number;
-        status: "open" | "complete";
-        createdAt: string;
-      }
-    >(
-      "SELECT id, title, description, numRounds, teamSize, status, createdAt FROM Event WHERE id = ?",
-    )
-    .get(eventId);
-
-  if (!event) {
+  if (!detail) {
     return NextResponse.json({ error: "Event not found" }, { status: 404 });
   }
-
-  const roster = db
-    .prepare<[number], EventDetailPerson>(
-      `SELECT p.id as id, p.name as name, p.gender as gender
-       FROM EventParticipant ep
-       JOIN Person p ON p.id = ep.personId
-       WHERE ep.eventId = ?
-       ORDER BY p.name ASC`,
-    )
-    .all(eventId);
-
-  const exclusionPairs = db
-    .prepare<[number], EventDetailExclusionPair>(
-      "SELECT personAId as personAId, personBId as personBId FROM ExclusionPair WHERE eventId = ?",
-    )
-    .all(eventId);
-
-  const roundRows = db
-    .prepare<[number], { id: number; roundNumber: number }>(
-      "SELECT id, roundNumber FROM Round WHERE eventId = ? ORDER BY roundNumber ASC",
-    )
-    .all(eventId);
-
-  const teamStmt = db.prepare<[number], { id: number }>(
-    "SELECT id FROM Team WHERE roundId = ? ORDER BY id ASC",
-  );
-  const memberStmt = db.prepare<[number], EventDetailPerson>(
-    `SELECT p.id as id, p.name as name, p.gender as gender
-     FROM TeamMember tm
-     JOIN Person p ON p.id = tm.personId
-     WHERE tm.teamId = ?
-     ORDER BY p.name ASC`,
-  );
-  const matchupStmt = db.prepare<
-    [number],
-    {
-      id: number;
-      teamAId: number;
-      teamBId: number;
-      scoreA: number | null;
-      scoreB: number | null;
-      winner: "teamA" | "teamB" | "tie" | null;
-    }
-  >("SELECT id, teamAId, teamBId, scoreA, scoreB, winner FROM Matchup WHERE roundId = ?");
-
-  const rounds: EventDetailRound[] = roundRows.map((r) => {
-    const teamRows = teamStmt.all(r.id);
-    const teamsById = new Map<number, EventDetailTeam>();
-    const presentIds = new Set<number>();
-    for (const t of teamRows) {
-      const members = memberStmt.all(t.id);
-      members.forEach((m) => presentIds.add(m.id));
-      teamsById.set(t.id, { id: t.id, members });
-    }
-
-    const matchupRows = matchupStmt.all(r.id);
-    const matchups: EventDetailMatchup[] = matchupRows.map((m) => ({
-      id: m.id,
-      teamA: teamsById.get(m.teamAId) ?? { id: m.teamAId, members: [] },
-      teamB: teamsById.get(m.teamBId) ?? { id: m.teamBId, members: [] },
-      scoreA: m.scoreA,
-      scoreB: m.scoreB,
-      winner: m.winner,
-    }));
-
-    const byes = roster.filter((p) => !presentIds.has(p.id));
-    const complete = matchups.length > 0 && matchups.every((m) => m.winner !== null);
-
-    return { id: r.id, roundNumber: r.roundNumber, complete, matchups, byes };
-  });
-
-  const currentRoundNumber = rounds.find((r) => !r.complete)?.roundNumber ?? null;
-
-  const detailWithoutLeaderboard = {
-    id: event.id,
-    title: event.title,
-    description: event.description,
-    numRounds: event.numRounds,
-    teamSize: event.teamSize,
-    status: event.status,
-    createdAt: event.createdAt,
-    rounds,
-    currentRoundNumber,
-    roster: roster.map((p) => ({ personId: p.id, name: p.name, gender: p.gender })),
-    exclusionPairs,
-  };
-  const detail: EventDetail = {
-    ...detailWithoutLeaderboard,
-    leaderboard: computeLeaderboard(detailWithoutLeaderboard),
-  };
 
   return NextResponse.json(detail);
 }

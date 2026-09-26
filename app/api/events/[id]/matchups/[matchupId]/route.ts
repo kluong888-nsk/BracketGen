@@ -37,12 +37,12 @@ function deriveWinner(scoreA: number, scoreB: number): Winner {
  * row by id, so re-submitting a scored matchup overwrites its scoreA/
  * scoreB/winner in place rather than creating a duplicate row.
  *
- * Deliberately does not check `Event.status` here. Milestone 8 owns
- * refusing edits once an event is marked complete; leaving that check out
- * for now doesn't prevent adding it later — it's a single guard, mirroring
- * the `existing.status === "complete"` check already used in
- * `PUT /api/events/:id`, that a future milestone can add right after the
- * event/matchup lookup below.
+ * Milestone 8: rejects with 400 if the matchup's event has
+ * `status === 'complete'`, mirroring the `existing.status === "complete"`
+ * check already used in `PUT /api/events/:id`. This is enforced here
+ * server-side (not just by hiding the UI's score-entry affordance once the
+ * event is complete) so a direct/bypassing API call can't edit results
+ * after completion either.
  */
 export async function PATCH(
   request: Request,
@@ -72,16 +72,20 @@ export async function PATCH(
 
     db.transaction(() => {
       const row = db
-        .prepare<[number], { id: number; eventId: number }>(
-          `SELECT m.id as id, r.eventId as eventId
+        .prepare<[number], { id: number; eventId: number; eventStatus: "open" | "complete" }>(
+          `SELECT m.id as id, r.eventId as eventId, e.status as eventStatus
            FROM Matchup m
            JOIN Round r ON r.id = m.roundId
+           JOIN Event e ON e.id = r.eventId
            WHERE m.id = ?`,
         )
         .get(matchupId);
 
       if (!row || row.eventId !== eventId) {
         throw new HttpError(404, "Matchup not found for this event");
+      }
+      if (row.eventStatus === "complete") {
+        throw new HttpError(400, "Cannot edit a matchup on a completed event");
       }
 
       db.prepare("UPDATE Matchup SET scoreA = ?, scoreB = ?, winner = ? WHERE id = ?").run(

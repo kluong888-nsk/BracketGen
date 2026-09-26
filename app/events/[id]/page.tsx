@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import type { EventDetail, EventDetailMatchup, EventDetailPerson, EventDetailRound } from "@/app/api/events/[id]/route";
 import type { LeaderboardRow } from "@/lib/events/leaderboard";
+import { isEventCompletionEligible } from "@/lib/events/completion";
 
 type Tab = "matchups" | "leaderboard";
 
@@ -83,15 +84,23 @@ function ScoreInput({
  * than being guessed client-side. Re-opening an already-scored matchup
  * prefills the existing scores, and saving again updates the same Matchup
  * row (see the PATCH route) rather than creating a new one.
+ *
+ * When `readOnly` (milestone 8: the event has `status === 'complete'`),
+ * renders as a plain non-interactive card — no click handler, no
+ * score-entry affordance — since the server now also rejects the PATCH
+ * outright for a completed event; this just keeps the UI from offering an
+ * action that would fail.
  */
 function MatchupCard({
   matchup,
   eventId,
   onScored,
+  readOnly,
 }: {
   matchup: EventDetailMatchup;
   eventId: string;
   onScored: () => Promise<void>;
+  readOnly: boolean;
 }) {
   const hasResult = matchup.winner !== null;
   const [editing, setEditing] = useState(false);
@@ -142,7 +151,7 @@ function MatchupCard({
     }
   }
 
-  if (editing) {
+  if (editing && !readOnly) {
     return (
       <div className="grid w-full grid-cols-[1fr_auto_1fr] items-start gap-3 rounded-md border border-foreground/40 bg-black/[.015] p-3 text-left dark:bg-white/[.03]">
         <div>
@@ -185,13 +194,8 @@ function MatchupCard({
     );
   }
 
-  return (
-    <button
-      type="button"
-      onClick={startEditing}
-      title={hasResult ? "Edit score" : "Enter score"}
-      className="grid w-full cursor-pointer grid-cols-[1fr_auto_1fr] items-center gap-3 rounded-md border border-black/[.1] bg-black/[.015] p-3 text-left transition hover:border-black/30 hover:bg-black/[.03] dark:border-white/[.12] dark:bg-white/[.03] dark:hover:border-white/30 dark:hover:bg-white/[.06]"
-    >
+  const cardContent = (
+    <>
       <div className={matchup.winner === "teamA" ? "font-bold text-blue-600 dark:text-blue-400" : ""}>
         <TeamRoster team={matchup.teamA} />
       </div>
@@ -238,6 +242,25 @@ function MatchupCard({
       >
         <TeamRoster team={matchup.teamB} />
       </div>
+    </>
+  );
+
+  if (readOnly) {
+    return (
+      <div className="grid w-full grid-cols-[1fr_auto_1fr] items-center gap-3 rounded-md border border-black/[.1] bg-black/[.015] p-3 text-left dark:border-white/[.12] dark:bg-white/[.03]">
+        {cardContent}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={startEditing}
+      title={hasResult ? "Edit score" : "Enter score"}
+      className="grid w-full cursor-pointer grid-cols-[1fr_auto_1fr] items-center gap-3 rounded-md border border-black/[.1] bg-black/[.015] p-3 text-left transition hover:border-black/30 hover:bg-black/[.03] dark:border-white/[.12] dark:bg-white/[.03] dark:hover:border-white/30 dark:hover:bg-white/[.06]"
+    >
+      {cardContent}
     </button>
   );
 }
@@ -247,11 +270,13 @@ function RoundSection({
   isCurrent,
   eventId,
   onScored,
+  readOnly,
 }: {
   round: EventDetailRound;
   isCurrent: boolean;
   eventId: string;
   onScored: () => Promise<void>;
+  readOnly: boolean;
 }) {
   return (
     <section
@@ -277,7 +302,13 @@ function RoundSection({
 
       <div className="mt-3 space-y-2">
         {round.matchups.map((m) => (
-          <MatchupCard key={m.id} matchup={m} eventId={eventId} onScored={onScored} />
+          <MatchupCard
+            key={m.id}
+            matchup={m}
+            eventId={eventId}
+            onScored={onScored}
+            readOnly={readOnly}
+          />
         ))}
       </div>
 
@@ -544,6 +575,8 @@ export default function EventPage() {
   const [event, setEvent] = useState<EventDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("matchups");
+  const [markingComplete, setMarkingComplete] = useState(false);
+  const [markCompleteError, setMarkCompleteError] = useState<string | null>(null);
 
   useEffect(() => {
     let ignore = false;
@@ -574,6 +607,47 @@ export default function EventPage() {
       setError(err instanceof Error ? err.message : "Failed to load event");
     }
   }
+
+  /**
+   * Handles the "Mark Event Complete" button (milestone 8). Confirms first
+   * since this is irreversible (no "reopen" flow exists), then POSTs to
+   * `/api/events/:id/complete`, which re-checks eligibility server-side
+   * before flipping `Event.status` — so even if this button were somehow
+   * clicked while stale (e.g. a score was un-done in another tab), the
+   * server has the final say, not this client-side check.
+   */
+  async function handleMarkComplete() {
+    if (!event) return;
+    const confirmed = window.confirm(
+      "Mark this event complete? All results will be locked and this cannot be undone.",
+    );
+    if (!confirmed) return;
+
+    setMarkingComplete(true);
+    setMarkCompleteError(null);
+    try {
+      const res = await fetch(`/api/events/${eventId}/complete`, { method: "POST" });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(data.error ?? `Failed to mark event complete (${res.status})`);
+      }
+      const data = (await res.json()) as EventDetail;
+      setEvent(data);
+    } catch (err) {
+      setMarkCompleteError(
+        err instanceof Error ? err.message : "Failed to mark event complete",
+      );
+    } finally {
+      setMarkingComplete(false);
+    }
+  }
+
+  /** Mirrors the server's eligibility check (lib/events/completion.ts) so
+   * the button only shows once every round is fully scored — but marking
+   * complete only ever happens via the explicit click above, never
+   * automatically just because this becomes true (CLAUDE.md Key Decision). */
+  const canMarkComplete =
+    event !== null && event.status !== "complete" && isEventCompletionEligible(event);
 
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-16">
@@ -627,8 +701,24 @@ export default function EventPage() {
                   Edit
                 </Link>
               )}
+              {canMarkComplete && (
+                <button
+                  type="button"
+                  onClick={() => void handleMarkComplete()}
+                  disabled={markingComplete}
+                  className="rounded-md bg-foreground px-3 py-1.5 text-sm font-medium text-background hover:opacity-90 disabled:opacity-60"
+                >
+                  {markingComplete ? "Marking complete…" : "Mark Event Complete"}
+                </button>
+              )}
             </div>
           </div>
+
+          {markCompleteError && (
+            <p className="mt-3 rounded-md bg-red-100 px-3 py-2 text-sm text-red-800 dark:bg-red-900/40 dark:text-red-300">
+              {markCompleteError}
+            </p>
+          )}
 
           <div className="mt-6 flex gap-1 border-b border-black/[.08] dark:border-white/[.1]">
             {(
@@ -667,6 +757,7 @@ export default function EventPage() {
                     isCurrent={round.roundNumber === event.currentRoundNumber}
                     eventId={eventId}
                     onScored={refreshEvent}
+                    readOnly={event.status === "complete"}
                   />
                 ))}
               </div>
