@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import type { EventDetail, EventDetailMatchup, EventDetailPerson, EventDetailRound } from "@/app/api/events/[id]/route";
+import type { LeaderboardRow } from "@/lib/events/leaderboard";
 
 type Tab = "matchups" | "leaderboard";
 
@@ -296,6 +297,246 @@ function RoundSection({
   );
 }
 
+type SortKey = "name" | "record" | "pointsFor" | "pointsAgainst" | "plusMinus";
+type SortDir = "asc" | "desc";
+
+const LEADERBOARD_COLUMNS: {
+  key: SortKey;
+  label: string;
+  align: "left" | "right";
+  /** Shown as a native hover tooltip on the header, for abbreviated columns
+   * whose meaning isn't obvious at a glance. */
+  title?: string;
+}[] = [
+  { key: "name", label: "Name", align: "left" },
+  {
+    key: "record",
+    label: "W-L-T",
+    align: "right",
+    title: "Wins-Losses-Ties (ranked by win %, ties broken by +/-)",
+  },
+  { key: "pointsFor", label: "PF", align: "right", title: "Points scored (points for)" },
+  {
+    key: "pointsAgainst",
+    label: "PA",
+    align: "right",
+    title: "Points scored against (points allowed)",
+  },
+  { key: "plusMinus", label: "+/-", align: "right", title: "Point differential (PF minus PA)" },
+];
+
+/** Win percentage used to rank the W-L-T column: wins / games played, so
+ * someone who played fewer games isn't penalized for it (e.g. 2-0 outranks
+ * 5-2) — a person with no games played yet ranks at the bottom (0), not
+ * NaN. Ties aren't given partial credit here, only used as the games-played
+ * denominator; per the organizer's request, ties in win % are broken by
+ * point differential (+/-), not by raw win count. */
+function winPercentage(row: LeaderboardRow): number {
+  return row.gamesPlayed === 0 ? 0 : row.wins / row.gamesPlayed;
+}
+
+/** A leaderboard row with its tournament seed attached. */
+type SeededLeaderboardRow = LeaderboardRow & { seed: number };
+
+/**
+ * Assigns each roster member a fixed tournament seed (1 = best) by the same
+ * ranking the W-L-T column defaults to — win % first (so fewer games played
+ * doesn't drag someone down), ties broken by point differential, and any
+ * remaining tie broken by name for a stable, deterministic order. This is
+ * independent of whatever column the table is currently sorted/displayed
+ * by, and of the "Show top X seeds" filter below — a person's seed number
+ * doesn't change just because the table is being viewed sorted by name or
+ * filtered down to a subset. Per CLAUDE.md, this is exactly the ranking
+ * data a future playoff bracket would seed from.
+ */
+function computeSeeds(rows: LeaderboardRow[]): SeededLeaderboardRow[] {
+  const ranked = [...rows].sort((a, b) => {
+    return (
+      winPercentage(b) - winPercentage(a) ||
+      b.plusMinus - a.plusMinus ||
+      a.name.localeCompare(b.name)
+    );
+  });
+  return ranked.map((row, i) => ({ ...row, seed: i + 1 }));
+}
+
+/** Comparable value for every sortable column except "record", which needs
+ * its own two-key (win % then +/-) comparator below since it can't be
+ * reduced to a single independent scalar. */
+function sortValue(row: LeaderboardRow, key: Exclude<SortKey, "record">): number | string {
+  switch (key) {
+    case "name":
+      return row.name.toLowerCase();
+    case "pointsFor":
+      return row.pointsFor;
+    case "pointsAgainst":
+      return row.pointsAgainst;
+    case "plusMinus":
+      return row.plusMinus;
+  }
+}
+
+/**
+ * Leaderboard tab (CLAUDE.md Events Page > Leaderboard): per-person W-L-T,
+ * points for/against, and +/-, scoped to this event, sortable by clicking
+ * any column header. `rows` come straight from `EventDetail.leaderboard`,
+ * which the server recomputes from scratch on every `GET /api/events/:id`
+ * (see lib/events/leaderboard.ts) — so re-fetching after a score correction
+ * on the Matchups tab shows updated numbers with no extra work here.
+ */
+function LeaderboardTable({ rows }: { rows: LeaderboardRow[] }) {
+  const [sortKey, setSortKey] = useState<SortKey>("record");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  /** Raw text of the "Show top X seeds" input; "" means no filter (show
+   * everyone). Kept as a string (not a number) so the field can be cleared
+   * without briefly coercing to 0. */
+  const [topXInput, setTopXInput] = useState("");
+
+  function handleHeaderClick(key: SortKey) {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(key === "name" ? "asc" : "desc");
+    }
+  }
+
+  // Seeds are computed over the FULL roster first (see computeSeeds), then
+  // the "Show top X seeds" filter trims the list down to seeds 1..X, and
+  // only THEN is the remaining set re-sorted by whichever column the
+  // organizer clicked — so filtering always means "the top X by seed", not
+  // "the top X of whatever's currently on screen".
+  const seeded = computeSeeds(rows);
+
+  const topX = Number.parseInt(topXInput, 10);
+  const hasTopXFilter = topXInput.trim() !== "" && Number.isInteger(topX) && topX > 0;
+  const filtered = hasTopXFilter ? seeded.filter((r) => r.seed <= topX) : seeded;
+
+  const sorted = [...filtered].sort((a, b) => {
+    let cmp: number;
+    if (sortKey === "record") {
+      cmp = winPercentage(a) - winPercentage(b) || a.plusMinus - b.plusMinus;
+    } else {
+      const av = sortValue(a, sortKey);
+      const bv = sortValue(b, sortKey);
+      cmp = typeof av === "string" ? av.localeCompare(bv as string) : (av as number) - (bv as number);
+    }
+    return sortDir === "asc" ? cmp : -cmp;
+  });
+
+  if (rows.length === 0) {
+    return (
+      <p className="text-sm text-zinc-600 dark:text-zinc-400">
+        No participants on this event&apos;s roster.
+      </p>
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-3 flex items-center gap-2 text-sm">
+        <label htmlFor="leaderboard-top-x" className="text-zinc-600 dark:text-zinc-400">
+          Show top
+        </label>
+        <input
+          id="leaderboard-top-x"
+          type="number"
+          min={1}
+          max={rows.length}
+          step={1}
+          inputMode="numeric"
+          value={topXInput}
+          onChange={(e) => setTopXInput(e.target.value)}
+          placeholder={String(rows.length)}
+          className="w-16 rounded-md border border-black/[.15] bg-transparent px-2 py-1 text-right outline-none focus:border-black/40 dark:border-white/[.2] dark:focus:border-white/50"
+        />
+        <span className="text-zinc-600 dark:text-zinc-400">
+          seed{topX === 1 ? "" : "s"} of {rows.length}
+        </span>
+        {topXInput.trim() !== "" && (
+          <button
+            type="button"
+            onClick={() => setTopXInput("")}
+            className="text-xs font-medium text-zinc-500 underline-offset-2 hover:text-foreground hover:underline dark:text-zinc-400"
+          >
+            Show all
+          </button>
+        )}
+      </div>
+
+      {hasTopXFilter && filtered.length === 0 && (
+        <p className="mb-3 text-sm text-zinc-600 dark:text-zinc-400">
+          No seeds in that range.
+        </p>
+      )}
+
+      <table className="w-full border-collapse text-sm">
+        <thead>
+          <tr className="border-b border-black/[.1] dark:border-white/[.12]">
+            <th
+              scope="col"
+              title="Tournament seed — ranked by win %, ties broken by +/-"
+              className="cursor-help py-2 text-left font-semibold text-zinc-600 dark:text-zinc-400"
+            >
+              Seed
+            </th>
+            {LEADERBOARD_COLUMNS.map((col) => (
+              <th
+                key={col.key}
+                scope="col"
+                title={col.title}
+                aria-sort={
+                  sortKey === col.key ? (sortDir === "asc" ? "ascending" : "descending") : "none"
+                }
+                className={`py-2 font-semibold text-zinc-600 dark:text-zinc-400 ${
+                  col.align === "right" ? "text-right" : "text-left"
+                } ${col.title ? "cursor-help" : ""}`}
+              >
+                <button
+                  type="button"
+                  onClick={() => handleHeaderClick(col.key)}
+                  className={`inline-flex items-center gap-1 hover:text-foreground ${
+                    col.align === "right" ? "flex-row-reverse" : ""
+                  }`}
+                >
+                  {col.label}
+                  {sortKey === col.key && (
+                    <span aria-hidden="true" className="text-[10px]">
+                      {sortDir === "asc" ? "▲" : "▼"}
+                    </span>
+                  )}
+                </button>
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((row) => (
+            <tr
+              key={row.personId}
+              className="border-b border-black/[.05] last:border-0 dark:border-white/[.06]"
+            >
+              <td className="py-2 tabular-nums text-zinc-500 dark:text-zinc-400">#{row.seed}</td>
+              <td className="py-2">
+                {row.name}
+                <GenderTag gender={row.gender} />
+              </td>
+              <td className="py-2 text-right tabular-nums">
+                {row.wins}-{row.losses}-{row.ties}
+              </td>
+              <td className="py-2 text-right tabular-nums">{row.pointsFor}</td>
+              <td className="py-2 text-right tabular-nums">{row.pointsAgainst}</td>
+              <td className="py-2 text-right tabular-nums">
+                {row.plusMinus > 0 ? `+${row.plusMinus}` : row.plusMinus}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function EventPage() {
   const params = useParams<{ id: string }>();
   const eventId = params.id;
@@ -431,11 +672,7 @@ export default function EventPage() {
               </div>
             )}
 
-            {tab === "leaderboard" && (
-              <p className="text-sm text-zinc-600 dark:text-zinc-400">
-                Leaderboard coming soon.
-              </p>
-            )}
+            {tab === "leaderboard" && <LeaderboardTable rows={event.leaderboard} />}
           </div>
         </>
       )}

@@ -9,6 +9,7 @@ import {
   writeExclusions,
   writeRoster,
 } from "@/lib/events/persist";
+import { computeLeaderboard, type LeaderboardRow } from "@/lib/events/leaderboard";
 
 type Gender = "Male" | "Female" | "Non-Binary";
 
@@ -73,6 +74,11 @@ export interface EventDetail {
   /** Full exclusion-pair list by Person id — used to prefill the Edit
    * Page's exclusion list. */
   exclusionPairs: EventDetailExclusionPair[];
+  /** Per-person aggregate stats (Leaderboard tab), one row per roster
+   * member, computed fresh from `rounds`/`roster` on every GET — see
+   * lib/events/leaderboard.ts. Never stored, so an edited score is
+   * reflected here on the very next fetch with no invalidation needed. */
+  leaderboard: LeaderboardRow[];
 }
 
 /**
@@ -193,7 +199,7 @@ export async function GET(
 
   const currentRoundNumber = rounds.find((r) => !r.complete)?.roundNumber ?? null;
 
-  const detail: EventDetail = {
+  const detailWithoutLeaderboard = {
     id: event.id,
     title: event.title,
     description: event.description,
@@ -205,6 +211,10 @@ export async function GET(
     currentRoundNumber,
     roster: roster.map((p) => ({ personId: p.id, name: p.name, gender: p.gender })),
     exclusionPairs,
+  };
+  const detail: EventDetail = {
+    ...detailWithoutLeaderboard,
+    leaderboard: computeLeaderboard(detailWithoutLeaderboard),
   };
 
   return NextResponse.json(detail);
